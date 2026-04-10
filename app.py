@@ -1,12 +1,12 @@
 import streamlit as st
 import tensorflow as tf
 from tensorflow.keras.applications.efficientnet import preprocess_input
-from tensorflow.keras.preprocessing.image import load_img, img_to_array
 import numpy as np
 from PIL import Image
 from tensorflow.keras.layers import Layer, Conv2D, concatenate
+import cv2
+import requests
 
-# ---------- CUSTOM LAYER DEFINITION ----------
 class fire_module(Layer):
     def __init__(self, squeeze, expand, **kwargs):
         super().__init__(**kwargs)
@@ -25,38 +25,76 @@ class fire_module(Layer):
         config.update({'squeeze': self.squeeze, 'expand': self.expand})
         return config
 
-# ---------- LOAD MODEL WITH CUSTOM OBJECT ----------
-import requests
+def reduce_noise(image):
+    return cv2.bilateralFilter(image, d=9, sigmaColor=75, sigmaSpace=75)
 
-url = "https://huggingface.co/spaces/M-Parames01/thermal-defect-model/resolve/main/fusion_resume_model_1.keras?download=true"
-response = requests.get(url)
-with open("fusion_resume_model_1.keras", "wb") as f:
-    f.write(response.content)
+def extract_roi(image, roi_size=160):
+    h, w, _ = image.shape
+    cx, cy = w // 2, h // 2
+    half = roi_size // 2
+    roi = image[cy-half:cy+half, cx-half:cx+half]
+    if roi.size == 0:
+        return image
+    return reduce_noise(roi)
 
-# Model load
-model = tf.keras.models.load_model("fusion_resume_model_1.keras", custom_objects={'fire_module': fire_module}, compile=False)
+def preprocess_image(uploaded_file):
+    img = Image.open(uploaded_file).convert('RGB')
+    img = img.resize((224, 224))
+    img_np = np.array(img).astype(np.uint8)
 
-# ---------- CLASS NAMES ----------
-CLASS_NAMES = ['No_Defect', 'Minor_Defect', 'Major_Defect']
+    roi = extract_roi(img_np, roi_size=160)
+    roi_resized = cv2.resize(roi, (224, 224))
 
-# ---------- PAGE UI ----------
-st.title("🔥 Thermal Image Defect Detection")
-uploaded_file = st.file_uploader("Choose a thermal image...", type=["jpg","jpeg","png"])
+    # First preprocess_input
+    x = preprocess_input(roi_resized.astype(np.float32))
 
-if uploaded_file:
-    # Preprocess
-    img = Image.open(uploaded_file).convert('RGB').resize((224,224))
-    img_array = img_to_array(img)
-    img_array = preprocess_input(img_array)
-    img_array = np.expand_dims(img_array, axis=0)
-    
-    # Predict
-    pred = model.predict(img_array)
+    # Min-max to [0,1]
+    x_min, x_max = x.min(), x.max()
+    if x_max - x_min > 1e-8:
+        x_norm = (x - x_min) / (x_max - x_min)
+    else:
+        x_norm = x - x_min
+
+    # Scale to 0-255 and uint8
+    x_uint8 = (x_norm * 255).astype(np.uint8)
+
+    # Second preprocess_input
+    x_final = preprocess_input(x_uint8.astype(np.float32))
+
+    return np.expand_dims(x_final, axis=0), Image.fromarray(roi_resized)
+
+@st.cache_resource
+def load_model():
+    url = "https://huggingface.co/spaces/M-Parames01/thermal-defect-model/resolve/main/fusion_resume_model_1.keras?download=true"
+    response = requests.get(url)
+    with open("fusion_resume_model_1.keras", "wb") as f:
+        f.write(response.content)
+    return tf.keras.models.load_model(
+        "fusion_resume_model_1.keras",
+        custom_objects={'fire_module': fire_module},
+        compile=False
+    )
+
+model = load_model()
+CLASS_NAMES = ['Major_Defect', 'Minor_Defect', 'No_Defect']
+
+st.title("🔥 Thermal Fruit Image Defect Detection")
+uploaded_file = st.file_uploader("Choose a thermal image...", type=["jpg", "jpeg", "png"])
+
+if uploaded_file is not None:
+    original = Image.open(uploaded_file).convert('RGB')
+    st.image(original, caption="Original", width=300)
+
+    roi_batch, roi_display = preprocess_image(uploaded_file)
+    st.image(roi_display, caption="ROI after preprocessing", width=300)
+
+    pred = model.predict(roi_batch)
     pred_class = CLASS_NAMES[np.argmax(pred[0])]
     confidence = np.max(pred[0])
-    
-    # Display
-    st.image(uploaded_file, caption="Uploaded Image", width=300)
-    st.success(f"Prediction: {pred_class}")
+
+    st.success(f"**Prediction:** {pred_class}")
     st.metric("Confidence", f"{confidence:.2%}")
     
+    # Display true model accuracy
+    st.caption(f"📈 **Model's overall validation accuracy:** 92% (on unseen thermal images)")
+    st.caption("⚠️ Confidence score is model's 'sureness', not its accuracy. The model is correct in 92 out of 100 images on average.")
